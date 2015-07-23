@@ -73,7 +73,8 @@ func _main() error {
 			} else if argIsShortOpt && i == 1 && c == '-' {
 				argIsShortOpt = false
 				argIsLongOpt = true
-				continue
+				rest = arg[i+1:]
+				break
 			}
 
 			if argIsShortOpt {
@@ -90,10 +91,6 @@ func _main() error {
 				} else {
 					return fmt.Errorf("Unknown short option '%v'", c)
 				}
-			}
-			if argIsLongOpt {
-				rest = arg[i+1:]
-				break
 			}
 
 			if c == '@' {

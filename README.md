@@ -1,7 +1,7 @@
 # nssh
 Golang command line ssh utility for running programs remotely over multiple hops.
 
-Useful for executing things through a jump host when the jump host is a single entry point, or it is NATing etc.
+Useful for executing things on a remote node via a jump host.
 
 ## Why write this?
 
@@ -11,12 +11,16 @@ My specific use case is automated provisioning for scale testing with temporary 
 
 ## Example
 With a network of:
-workstation <----> server1 <----> server2 <----> desiredserver
+workstation <----> jumphost <----> desiredserver
 We want to run 'ls -l' on desiredserver 
 
 Assuming that authorized_keys is set up on server1, server2 and desiredserver to contain workstation's id_rsa.pub, one can run:
 
-nssh user1@server1 user2@server2 user3@desiredserver ls -l
+nssh user1@jumphost user2@desiredserver ls -l
+
+The server hops are determined heuristically by the presence of '@' in the argument. If you're actually running a command with an '@' in it, an override is possible:
+
+nssh user1@jumphost user2@desiredserver --cmd stupidly_named_program@who_does_this_anyway
 
 ## TODO (not likely to happen soon though)
 - Get 'shell' going, not just 'exec'. But I recommend still just using openssh if fully interactive anyway. This is a helpful test util for deployment automation when using jump hosts
