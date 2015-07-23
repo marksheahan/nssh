@@ -43,6 +43,7 @@ func _main() error {
 	}
 	defaultPrivateKeyPath := path.Join(usr.HomeDir, ".ssh", "id_rsa")
 	reqGlobalPrivateKeyPath := defaultPrivateKeyPath
+	indexedPrivateKeyPath := map[int]string{}
 
 	// parse through arguments; the first that we don't recognise is the command to run
 	// heuristic to try and detect hostname stuff by whether it has @ in it. Override with --cmd.
@@ -82,9 +83,18 @@ func _main() error {
 					verbosity++
 				} else if c == 'i' {
 					// next arg is path to the key to use.
-					rest = arg[i+1:] // TODO FIXME: parse the hop number
+					thisRest := arg[i+1:] // TODO FIXME: parse the hop number
 					nextArgFn = func(s string) error {
-						reqGlobalPrivateKeyPath = s
+						// if it's a -i path/to/key.pem, assume global
+						// if it is indexed: -i2 path/to/key.pem then that means hop 2 uses this key
+						// 0 based counting.
+						if thisRest == "" {
+							reqGlobalPrivateKeyPath = s
+						} else if n, err := strconv.Atoi(thisRest); err != nil {
+							return err
+						} else {
+							indexedPrivateKeyPath[n] = s
+						}
 						return nil
 					}
 					break
@@ -116,25 +126,35 @@ func _main() error {
 		}
 	}
 
-	var privKeySigner ssh.Signer = nil
-	if reqGlobalPrivateKeyPath != "" {
-		if pemData, err := ioutil.ReadFile(reqGlobalPrivateKeyPath); err != nil {
-			return err
-		} else if signer, err := ssh.ParsePrivateKey(pemData); err != nil {
-			return err
-		} else {
-			privKeySigner = signer
-		}
-	}
-	authMethods := []ssh.AuthMethod{}
-	if privKeySigner != nil {
-		authMethods = append(authMethods, ssh.PublicKeys(privKeySigner))
-	}
-	// TODO FIXME: if stdin is a tty, add password / keyboard interactive prompters
-
 	// assemble all the ssh config structs
 	hopConfigs := []*hopConfig{}
-	for _, hostPort := range hostPorts {
+	for hopIndex, hostPort := range hostPorts {
+
+		// find the private key to use for this hop. try indexed, fall back to global
+		var privKeySigner ssh.Signer = nil
+		privateKeyPath := reqGlobalPrivateKeyPath
+		if kp, ok := indexedPrivateKeyPath[hopIndex]; ok {
+			privateKeyPath = kp
+		}
+		if verbosity > 1 {
+			fmt.Fprintf(os.Stderr, "hop %d: private key path: %v\n", hopIndex, privateKeyPath)
+		}
+
+		if privateKeyPath != "" {
+			if pemData, err := ioutil.ReadFile(privateKeyPath); err != nil {
+				return err
+			} else if signer, err := ssh.ParsePrivateKey(pemData); err != nil {
+				return err
+			} else {
+				privKeySigner = signer
+			}
+		}
+		authMethods := []ssh.AuthMethod{}
+		if privKeySigner != nil {
+			authMethods = append(authMethods, ssh.PublicKeys(privKeySigner))
+		}
+		// TODO FIXME: if stdin is a tty, add password / keyboard interactive prompters
+
 		hc := &hopConfig{
 			host: "localhost",
 			port: 22,
@@ -144,6 +164,8 @@ func _main() error {
 				Auth:   authMethods,
 			},
 		}
+
+		// split user@host:port into user, host, port, store in config properly
 		if splitUserHost := strings.SplitN(hostPort, "@", 2); len(splitUserHost) == 2 {
 			hc.sshConfig.User = splitUserHost[0]
 			hc.host = splitUserHost[1]
@@ -162,7 +184,7 @@ func _main() error {
 		hopConfigs = append(hopConfigs, hc)
 	}
 
-	if verbosity > 0 {
+	if verbosity > 2 {
 		fmt.Fprintln(os.Stderr, "hostports", hostPorts)
 		fmt.Fprintln(os.Stderr, "cmd", commandToRun)
 	}
@@ -170,13 +192,22 @@ func _main() error {
 	// now lets dial and run
 	hops := []*hop{}
 	dialFunc := net.Dial
-	for _, hc := range hopConfigs {
+	for hopIndex, hc := range hopConfigs {
 		hostAddr := fmt.Sprintf("%s:%d", hc.host, hc.port)
+
+		if verbosity > 0 {
+			fmt.Fprintf(os.Stderr, "hop %d: tcp connect to %v\n", hopIndex, hostAddr)
+		}
+
 		tcpConn, err := dialFunc("tcp", hostAddr)
 		if err != nil {
 			return err
 		}
 		defer tcpConn.Close()
+
+		if verbosity > 0 {
+			fmt.Fprintf(os.Stderr, "hop %d: ssh connect to %v\n", hopIndex, hostAddr)
+		}
 
 		sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, hostAddr, hc.sshConfig)
 		if err != nil {
