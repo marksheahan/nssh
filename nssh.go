@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"os"
+	"os/exec"
 	"os/user"
 	"path"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
@@ -48,6 +52,7 @@ func _main() error {
 	// parse through arguments; the first that we don't recognise is the command to run
 	// heuristic to try and detect hostname stuff by whether it has @ in it. Override with --cmd.
 	hostPorts := []string{}
+	runLocalWithForward := ""
 	commandToRun := []string{}
 	var nextArgFn func(string) error = nil
 	args := os.Args[1:]
@@ -113,6 +118,11 @@ func _main() error {
 			if rest == "cmd" {
 				commandToRun = args[argI+1:]
 				break
+			} else if rest == "run_local_fwd" {
+				nextArgFn = func(s string) error {
+					runLocalWithForward = s
+					return nil
+				}
 			} else {
 				return fmt.Errorf("unknown long opt: %v", rest)
 			}
@@ -189,6 +199,26 @@ func _main() error {
 		fmt.Fprintln(os.Stderr, "cmd", commandToRun)
 	}
 
+	// check that there is at least some sshing happening
+	if len(hopConfigs) == 0 {
+		return fmt.Errorf("no ssh hops")
+	}
+
+	// some other early exits
+	if runLocalWithForward != "" {
+		if len(commandToRun) > 0 {
+			// ok
+		} else {
+			return fmt.Errorf("run_local_fwd requested without command")
+		}
+	} else {
+		if len(commandToRun) > 0 {
+			// ok
+		} else {
+			return fmt.Errorf("shell not implemented yet")
+		}
+	}
+
 	// now lets dial and run
 	hops := []*hop{}
 	dialFunc := net.Dial
@@ -221,26 +251,102 @@ func _main() error {
 		hops = append(hops, &hop{config: hc, client: client})
 	}
 
-	// run command
-	if len(hops) == 0 {
-		return fmt.Errorf("no ssh hops")
-	}
-
 	lastClient := hops[len(hops)-1].client
-	session, err := lastClient.NewSession()
-	if err != nil {
-		return err
-	}
-	defer session.Close()
 
-	session.Stdin = os.Stdin
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
+	if runLocalWithForward != "" {
+		// we're setting up a port forward then running a local command with that port forward
+		if len(commandToRun) > 0 {
+			// set up a local listener, connect each accept to the remote host
+			localTcpListener, err := net.Listen("tcp", "localhost:0")
+			if err != nil {
+				return err
+			}
 
-	if len(commandToRun) > 0 {
-		cmdString := strings.Join(commandToRun, " ") // should probably quote these more but who cares
-		return session.Run(cmdString)
+			// templated replace {{fwd}} with the localTcpListener address
+			// so the user does:
+			// nssh --run_local_fwd targetserver:443 user@jumphost curl -k -L https://{{fwd}}/something
+			// and fwd will get replaced with localhost:41245 (41245 is arbitrary port)
+			templatedCommand := []string{}
+			templateSource := map[string]interface{}{}
+			fnMap := template.FuncMap{
+				"fwd": func() string { return localTcpListener.Addr().String() },
+			}
+
+			for _, c := range commandToRun {
+				tmpl, err := template.New("script").Funcs(fnMap).Parse(c)
+				if err != nil {
+					return err
+				}
+				buf := &bytes.Buffer{}
+				if err := tmpl.Execute(buf, templateSource); err != nil {
+					return err
+				}
+				templatedCommand = append(templatedCommand, string(buf.Bytes()))
+			}
+
+			if verbosity > 2 {
+				fmt.Fprintln(os.Stderr, "templatedCommand", templatedCommand)
+			}
+
+			// set up a server daemon to listen to the local listener and initiate port forwards for each connection
+			go func() {
+				for {
+					// accept something from the port forward
+					localSvrConn, err := localTcpListener.Accept()
+					if err != nil {
+						break
+					}
+
+					// dial to the target host
+					forwardedTcpConn, err := lastClient.Dial("tcp", runLocalWithForward)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "forwarded dial to '%v' failed: %v", runLocalWithForward, err)
+						localSvrConn.Close()
+					} else {
+						go func() {
+							defer forwardedTcpConn.Close()
+							defer localSvrConn.Close()
+							doneChan := make(chan error, 2)
+							go func() {
+								_, err := io.Copy(forwardedTcpConn, localSvrConn)
+								doneChan <- err
+							}()
+							go func() {
+								_, err := io.Copy(localSvrConn, forwardedTcpConn)
+								doneChan <- err
+							}()
+							<-doneChan
+							<-doneChan
+						}()
+					}
+				}
+			}()
+
+			cmd := exec.Command(templatedCommand[0], templatedCommand[1:]...)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			return cmd.Run()
+		} else {
+			return fmt.Errorf("run_local_fwd requested without command")
+		}
 	} else {
-		return fmt.Errorf("shell not implemented yet")
+		// regular run a remote program
+		session, err := lastClient.NewSession()
+		if err != nil {
+			return err
+		}
+		defer session.Close()
+
+		session.Stdin = os.Stdin
+		session.Stdout = os.Stdout
+		session.Stderr = os.Stderr
+
+		if len(commandToRun) > 0 {
+			cmdString := strings.Join(commandToRun, " ") // should probably quote these more but who cares
+			return session.Run(cmdString)
+		} else {
+			return fmt.Errorf("shell not implemented yet")
+		}
 	}
 }
