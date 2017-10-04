@@ -8,10 +8,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/template"
 
 	"golang.org/x/crypto/ssh"
@@ -41,6 +43,16 @@ func main() {
 }
 
 func _main() error {
+
+	if IsTerminal() && false {
+		fd := int(os.Stdin.Fd())
+		if oldState, err := terminal.MakeRaw(fd); err != nil {
+			return err
+		} else {
+			defer terminal.Restore(fd, oldState)
+		}
+	}
+
 	usr, err := user.Current()
 	if err != nil {
 		return err
@@ -54,6 +66,9 @@ func _main() error {
 	hostPorts := []string{}
 	runLocalWithForward := ""
 	commandToRun := []string{}
+	forceTTYOn := false
+	forceTTYOff := false
+	useTTY := false
 	var nextArgFn func(string) error = nil
 	args := os.Args[1:]
 	verbosity := 0
@@ -161,6 +176,9 @@ func _main() error {
 		}
 		authMethods := []ssh.AuthMethod{}
 		if privKeySigner != nil {
+			if verbosity > 1 {
+				fmt.Fprintf(os.Stderr, "hop %d: adding private key signer: %v\n", hopIndex, privateKeyPath)
+			}
 			authMethods = append(authMethods, ssh.PublicKeys(privKeySigner))
 		}
 		// TODO FIXME: if stdin is a tty, add password / keyboard interactive prompters
@@ -179,6 +197,10 @@ func _main() error {
 		if splitUserHost := strings.SplitN(hostPort, "@", 2); len(splitUserHost) == 2 {
 			hc.sshConfig.User = splitUserHost[0]
 			hc.host = splitUserHost[1]
+			if splitUserPassword := strings.SplitN(splitUserHost[0], ":", 2); len(splitUserPassword) == 2 {
+				hc.sshConfig.User = splitUserPassword[0]
+				hc.sshConfig.Auth = append(hc.sshConfig.Auth, ssh.Password(splitUserPassword[1]))
+			}
 		} else if len(splitUserHost) == 1 {
 			hc.host = splitUserHost[0]
 		}
@@ -215,7 +237,7 @@ func _main() error {
 		if len(commandToRun) > 0 {
 			// ok
 		} else {
-			return fmt.Errorf("shell not implemented yet")
+			//return fmt.Errorf("shell not implemented yet")
 		}
 	}
 
@@ -252,6 +274,14 @@ func _main() error {
 	}
 
 	lastClient := hops[len(hops)-1].client
+
+	if forceTTYOn {
+		useTTY = true
+	} else if forceTTYOff {
+		useTTY = false
+	} else {
+		useTTY = len(commandToRun) == 0
+	}
 
 	if runLocalWithForward != "" {
 		// we're setting up a port forward then running a local command with that port forward
@@ -331,6 +361,15 @@ func _main() error {
 			return fmt.Errorf("run_local_fwd requested without command")
 		}
 	} else {
+		stdinRd, stdinWr, err := os.Pipe()
+		if err != nil {
+			return fmt.Errorf("error making stdin pipe: %v", err)
+		}
+		go func() {
+			defer stdinWr.Close()
+			io.Copy(stdinWr, os.Stdin)
+		}()
+
 		// regular run a remote program
 		session, err := lastClient.NewSession()
 		if err != nil {
@@ -338,7 +377,27 @@ func _main() error {
 		}
 		defer session.Close()
 
-		session.Stdin = os.Stdin
+		if useTTY {
+			fd := os.Stdin.Fd()
+			w, h, err := terminal.GetSize(int(fd))
+			if err != nil {
+				return err
+			}
+
+			// Set up terminal modes
+			modes := ssh.TerminalModes{
+				ssh.ECHO:          0,     // disable echoing
+				ssh.TTY_OP_ISPEED: 14400, // input speed = 14.4kbaud
+				ssh.TTY_OP_OSPEED: 14400, // output speed = 14.4kbaud
+			}
+
+			// Request pseudo terminal
+			if err := session.RequestPty(os.Getenv("TERM"), h, w, modes); err != nil {
+				return fmt.Errorf("request for pseudo terminal failed: %s", err)
+			}
+		}
+
+		session.Stdin = stdinRd
 		session.Stdout = os.Stdout
 		session.Stderr = os.Stderr
 
@@ -346,7 +405,35 @@ func _main() error {
 			cmdString := strings.Join(commandToRun, " ") // should probably quote these more but who cares
 			return session.Run(cmdString)
 		} else {
-			return fmt.Errorf("shell not implemented yet")
+			if err := session.Shell(); err != nil {
+				return err
+			}
+			if useTTY {
+				// capture SIGWINCH for resize stuff
+				sigwinchs := make(chan os.Signal, 1)
+				signal.Notify(sigwinchs, syscall.SIGWINCH)
+
+				for sig := range sigwinchs {
+					type sshWindowChangeRequest struct {
+						TermWidthChars uint32 // terminal width, characters (e.g., 80)
+						TermHeightRows uint32 // terminal height, rows (e.g., 24)
+						TermWidthPx    uint32 // terminal width, pixels (e.g., 640)
+						TermHeightPx   uint32 // terminal height, pixels (e.g., 480)
+					}
+					fd := os.Stdin.Fd()
+					w, h, err := terminal.GetSize(int(fd))
+					if err != nil {
+						// shit
+					} else {
+						req := sshWindowChangeRequest{uint32(w), uint32(h), 0, 0}
+						ok, err := session.SendRequest("window-change", true, ssh.Marshal(&req))
+						if err == nil && !ok {
+							fmt.Fprintf(os.Stderr, "ssh: sig %v window-change %d %d failed", sig, w, h)
+						}
+					}
+				}
+			}
+			return session.Wait()
 		}
 	}
 }
