@@ -190,6 +190,7 @@ func _main() error {
 				Config: ssh.Config{},
 				User:   usr.Username,
 				Auth:   authMethods,
+				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 			},
 		}
 
